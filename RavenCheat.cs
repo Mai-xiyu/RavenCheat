@@ -179,8 +179,9 @@ namespace RavenCheat
             try { ExplodeAllVehiclesHotkey(); } catch { }
             try { GrappleHookLogic(); } catch { }
             try { ForcePushLogic(); } catch { }
-            try { ShadowStrikeLogic(); } catch { }
-            try { RagdollAllLogic(); } catch { }
+            try { TornadoHotkey(); } catch { }
+            try { RecruitLogic(); } catch { }
+            try { DeathRayLogic(); } catch { }
         }
 
         private void LateUpdate()
@@ -298,10 +299,11 @@ namespace RavenCheat
             GUILayout.Label("  G = 索尔之锤 (准星处爆炸)");
             GUILayout.Label("  B = 空袭轰炸 (准星处大范围杀敌)");
             GUILayout.Label("  H = 一键爆掉所有敌方载具");
-            GUILayout.Label("  F = 🪝 钩锁/飞爪 (拉向准星位置)");
-            GUILayout.Label("  R = 💨 原力冲击波 (推飞周围敌人)");
-            GUILayout.Label("  Y = ⚡ Shadow Strike (瞬移到最近敌人背后)");
-            GUILayout.Label("  K = 🧍 布娃娃全图 (敌人瘰倒)");
+            GUILayout.Label("  F = 🪝 钩爪飞爪 (看敌人拉过来、看空地飞过去、看车把车抽过来)");
+            GUILayout.Label("  R = 💨 原力冲击波 (所有载具和敌人被炸飞)");
+            GUILayout.Label("  N = 🌪 召唤龙卷风 (绝望射程外的绝对咲咴咵!)");
+            GUILayout.Label("  J = 🔸 AI 招廓 (把敌人叛变成队友)");
+            GUILayout.Label("  M + 左键 = ☠ 死亡射线 (路径上一切爆炸)");
             GUILayout.Label("  Insert = 开关此菜单");
             GUI.DragWindow();
         }
@@ -861,35 +863,68 @@ namespace RavenCheat
             }
         }
 
-        // ============ 全民暴乱 ============
+        // ============ 全民大逃杀 (真·修复版) ============
+        // Bug 原因：游戏里 AI 的敌友判定并不直接看 actor.team，而是看 AiActorController.squad
+        // 只改 team 字段 → AI 的 squad 没变，它们立刻回到原来的阵营继续打玩家
+        // 真正生效的方法：
+        //   1) 把全部 AI 的 squad 字段设为 null（断开队伍归属）
+        //   2) 直接用反射把每个 AI 的 targetActor 强行设成另一个随机 AI
+        //   3) 把 team 打乱（视觉上红蓝分明）
+        //   4) 打开 bFriendlyFire 让所有人的子弹都能互相命中
         private void TriggerRiotMode()
         {
             if (ActorManager.instance == null || ActorManager.instance.actors == null) return;
             var asm = typeof(Actor).Assembly;
             var aiType = asm.GetType("AiActorController");
+
+            // 收集所有存活 AI（不含玩家）
+            var alive = new List<Actor>();
             foreach (var a in ActorManager.instance.actors)
+                if (a != null && a != localPlayer && !a.dead) alive.Add(a);
+            if (alive.Count < 2) return;
+
+            // 打开友军伤害，不然互相打不到对方
+            bFriendlyFire = true;
+
+            foreach (var a in alive)
             {
-                if (a == null || a == localPlayer || a.dead) continue;
-                // 修复：原游戏只有 2-3 个阵营，设置过大 teamId 会 IndexOutOfRange 崩游戏
-                // 随机分配为红蓝两队，达到真正的暴乱效果
                 try { a.team = UnityEngine.Random.Range(0, 2); } catch { }
 
-                // 清空 AI 旧目标，让它们重新选目标（否则会继续打玩家几秒）
-                if (aiType != null)
+                if (aiType == null) continue;
+                var aiComp = a.GetComponent(aiType);
+                if (aiComp == null) continue;
+                var t = aiComp.GetType();
+
+                // 清空 squad → 这是让 AI 脱离原队伍的关键
+                SetField(aiComp, t, "squad", null);
+                SetField(aiComp, t, "cover", null);
+                SetField(aiComp, t, "coverTarget", null);
+
+                // 找一个随机的其他 AI 作为攻击目标
+                Actor enemy;
+                int tries = 0;
+                do
                 {
-                    var aiComp = a.GetComponent(aiType);
-                    if (aiComp != null)
-                    {
-                        var t = aiComp.GetType();
-                        SetField(aiComp, t, "targetActor", null);
-                        SetField(aiComp, t, "hasTargetVisible", false);
-                        SetField(aiComp, t, "hasSeenTarget", false);
-                    }
-                }
+                    enemy = alive[UnityEngine.Random.Range(0, alive.Count)];
+                    tries++;
+                } while (enemy == a && tries < 10);
+                if (enemy == a) continue;
+
+                // 强行指定目标
+                SetField(aiComp, t, "targetActor", enemy);
+                SetField(aiComp, t, "hasTargetVisible", true);
+                SetField(aiComp, t, "hasSeenTarget", true);
+                SetField(aiComp, t, "lastKnownTargetPosition", enemy.transform.position);
+
+                // 有的 AI 存在私有 attackTarget / engageTarget 字段，一起填
+                SetField(aiComp, t, "attackTarget", enemy);
+                SetField(aiComp, t, "engageTarget", enemy);
             }
         }
 
-        // ============ 钩锁/飞爪 (F键) ============
+        // ============ 钩爪 / 飞爪 (F键) - Just Cause 风 ============
+        // 看着空地：把自己拉过去并获得冲量飞行
+        // 看着敌人/载具：把目标拉过来砸在你面前
         private float grappleCooldown = 0f;
         private void GrappleHookLogic()
         {
@@ -898,22 +933,75 @@ namespace RavenCheat
             if (mainCam == null) return;
 
             Ray ray = new Ray(mainCam.transform.position, mainCam.transform.forward);
-            int mask = ~((1 << 9) | (1 << 18));
             RaycastHit hit;
-            if (!Physics.Raycast(ray, out hit, 500f, mask)) return;
+            if (!Physics.Raycast(ray, out hit, 500f)) return;
+            grappleCooldown = 0.25f;
 
-            grappleCooldown = 0.3f;
-            Vector3 dest = hit.point + Vector3.up * 1.5f;
+            // 1) 是否命中了载具 → 把车砸过来
+            Vehicle hitVehicle = hit.collider.GetComponentInParent<Vehicle>();
+            if (hitVehicle != null && (localPlayer.seat == null || hitVehicle != localPlayer.seat.vehicle))
+            {
+                Rigidbody vrb = hitVehicle.GetComponent<Rigidbody>();
+                if (vrb != null)
+                {
+                    Vector3 playerFront = localPlayer.transform.position + mainCam.transform.forward * 4f + Vector3.up * 2f;
+                    Vector3 toMe = (playerFront - hitVehicle.transform.position);
+                    vrb.velocity = toMe.normalized * 60f + Vector3.up * 10f; // 飞过来
+                    return;
+                }
+            }
+
+            // 2) 是否命中了敌人 → 抓过来扔地上
+            Actor hitActor = hit.collider.GetComponentInParent<Actor>();
+            if (hitActor != null && hitActor != localPlayer && !hitActor.dead)
+            {
+                Rigidbody arb = null;
+                try { arb = hitActor.rigidbody; } catch { }
+                Vector3 front = localPlayer.transform.position + mainCam.transform.forward * 3f + Vector3.up * 1f;
+                if (arb != null)
+                {
+                    arb.isKinematic = false;
+                    arb.velocity = (front - hitActor.transform.position).normalized * 50f + Vector3.up * 5f;
+                }
+                else
+                {
+                    hitActor.transform.position = front;
+                }
+                // 让目标瘫倒
+                try
+                {
+                    var m = hitActor.GetType().GetMethod("Ragdoll", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, Type.EmptyTypes, null);
+                    if (m != null) m.Invoke(hitActor, null);
+                } catch { }
+                return;
+            }
+
+            // 3) 空地 → 自己飞过去（不是瞬移！带抛物线冲量飞行）
+            Rigidbody rb = null;
+            try { rb = localPlayer.rigidbody; } catch { }
+            Vector3 dir = (hit.point + Vector3.up * 2f) - localPlayer.transform.position;
+            float dist = dir.magnitude;
+            if (dist < 0.1f) return;
+            // 用抛物线公式算初速度，让你真的飞过去
+            Vector3 flat = new Vector3(dir.x, 0, dir.z);
+            float flatDist = flat.magnitude;
+            float yDiff = dir.y;
+            float t = Mathf.Clamp(dist / 30f, 0.4f, 1.2f); // 飞行时间
+            float g = Mathf.Abs(Physics.gravity.y);
+            Vector3 launch = flat.normalized * (flatDist / t) + Vector3.up * (yDiff / t + 0.5f * g * t);
 
             CharacterController cc = localPlayer.GetComponentInChildren<CharacterController>();
             if (cc != null) cc.enabled = false;
-            try { localPlayer.SetPositionAndRotation(dest, localPlayer.transform.rotation); }
-            catch { localPlayer.transform.position = dest; }
-            if (cc != null) cc.enabled = true;
+            if (rb != null) { rb.isKinematic = false; rb.velocity = launch; }
+            else localPlayer.transform.position += launch.normalized * 2f;
+            // 飞行中不让玩家落地卡住 → 0.3 秒后恢复 CharacterController
+            StartCoroutine(ReenableCC(cc, 0.3f));
+        }
 
-            Rigidbody rb = null;
-            try { rb = localPlayer.rigidbody; } catch { }
-            if (rb != null) rb.velocity = mainCam.transform.forward * 5f;
+        private IEnumerator ReenableCC(CharacterController cc, float delay)
+        {
+            yield return new WaitForSeconds(delay);
+            if (cc != null) cc.enabled = true;
         }
 
         // ============ 原力冲击波 (R键) ============
@@ -926,6 +1014,7 @@ namespace RavenCheat
             forceCooldown = 1f;
 
             Vector3 center = localPlayer.transform.position;
+            // 炸飞所有人
             foreach (var a in ActorManager.instance.actors)
             {
                 if (a == null || a == localPlayer || a.dead) continue;
@@ -938,54 +1027,159 @@ namespace RavenCheat
                 Rigidbody arb = null;
                 try { arb = a.rigidbody; } catch { }
                 if (arb != null) { arb.isKinematic = false; arb.velocity = push; }
-
-                // 让 AI 进入布娃娃状态
-                try
-                {
-                    var m = a.GetType().GetMethod("Ragdoll", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, Type.EmptyTypes, null);
-                    if (m != null) m.Invoke(a, null);
-                } catch { }
+            }
+            // 炸飞所有载具（这才是真爽）
+            var vehicles = UnityEngine.Object.FindObjectsOfType<Vehicle>();
+            foreach (var v in vehicles)
+            {
+                if (v == null) continue;
+                if (localPlayer.seat != null && v == localPlayer.seat.vehicle) continue;
+                Vector3 dir = v.transform.position - center;
+                float d = dir.magnitude;
+                if (d > 35f || d < 0.1f) continue;
+                Rigidbody vrb = v.GetComponent<Rigidbody>();
+                if (vrb != null) vrb.velocity = dir.normalized * 50f + Vector3.up * 20f;
             }
         }
 
-        // ============ Shadow Strike (Y键) — 瞬移到最近敌人背后 ============
-        private void ShadowStrikeLogic()
-        {
-            if (!Input.GetKeyDown(KeyCode.Y)) return;
-            Actor target = FindClosestEnemy(localPlayer.transform.position);
-            if (target == null) return;
+        // ============ 龙卷风 (按 N 键召唤) ============
+        // 在准星位置生成龙卷风，持续 6 秒吸引敌人和载具螺旋上升，结束后爆炸
+        private readonly List<TornadoData> activeTornados = new List<TornadoData>();
+        private class TornadoData { public Vector3 pos; public float timeLeft; }
 
-            Vector3 behind = target.transform.position - target.transform.forward * 1.5f + Vector3.up * 0.5f;
-            CharacterController cc = localPlayer.GetComponentInChildren<CharacterController>();
-            if (cc != null) cc.enabled = false;
-            try { localPlayer.SetPositionAndRotation(behind, Quaternion.LookRotation(target.transform.position - behind)); }
-            catch { localPlayer.transform.position = behind; }
-            if (cc != null) cc.enabled = true;
+        private void TornadoHotkey()
+        {
+            if (Input.GetKeyDown(KeyCode.N) && mainCam != null)
+            {
+                Ray ray = new Ray(mainCam.transform.position, mainCam.transform.forward);
+                RaycastHit hit;
+                if (Physics.Raycast(ray, out hit, 5000f))
+                {
+                    activeTornados.Add(new TornadoData { pos = hit.point, timeLeft = 6f });
+                }
+            }
+
+            if (activeTornados.Count == 0) return;
+            for (int i = activeTornados.Count - 1; i >= 0; i--)
+            {
+                var t = activeTornados[i];
+                t.timeLeft -= Time.deltaTime;
+
+                float radius = 35f;
+                // 吸敌人
+                foreach (var a in ActorManager.instance.actors)
+                {
+                    if (a == null || a == localPlayer || a.dead) continue;
+                    Vector3 rel = t.pos - a.transform.position;
+                    rel.y = 0f;
+                    float d = rel.magnitude;
+                    if (d > radius || d < 0.5f) continue;
+
+                    // 切向速度 (旋转) + 向中心 + 往上
+                    Vector3 tangent = Vector3.Cross(Vector3.up, rel.normalized);
+                    Vector3 vel = tangent * 25f + rel.normalized * 15f + Vector3.up * 12f;
+                    Rigidbody arb = null;
+                    try { arb = a.rigidbody; } catch { }
+                    if (arb != null) { arb.isKinematic = false; arb.velocity = vel; }
+                }
+                // 吸载具
+                var vehs = UnityEngine.Object.FindObjectsOfType<Vehicle>();
+                foreach (var v in vehs)
+                {
+                    if (v == null) continue;
+                    if (localPlayer.seat != null && v == localPlayer.seat.vehicle) continue;
+                    Vector3 rel = t.pos - v.transform.position;
+                    rel.y = 0f;
+                    float d = rel.magnitude;
+                    if (d > radius || d < 0.5f) continue;
+                    Vector3 tangent = Vector3.Cross(Vector3.up, rel.normalized);
+                    Vector3 vel = tangent * 30f + rel.normalized * 10f + Vector3.up * 14f;
+                    Rigidbody vrb = v.GetComponent<Rigidbody>();
+                    if (vrb != null) { vrb.useGravity = true; vrb.velocity = vel; }
+                }
+
+                // 时间到：原地大爆炸
+                if (t.timeLeft <= 0f)
+                {
+                    try { ExplodeAt(t.pos, 30f); } catch { }
+                    activeTornados.RemoveAt(i);
+                }
+            }
         }
 
-        // ============ 布娃娃全图 (K键) ============
-        private void RagdollAllLogic()
+        // ============ AI 招募 (J键) ============
+        // 把准星指向的敌人叛变为你的队友
+        private void RecruitLogic()
         {
-            if (!Input.GetKeyDown(KeyCode.K)) return;
-            if (ActorManager.instance == null) return;
+            if (!Input.GetKeyDown(KeyCode.J)) return;
+            if (mainCam == null) return;
+            Ray ray = new Ray(mainCam.transform.position, mainCam.transform.forward);
+            RaycastHit hit;
+            if (!Physics.Raycast(ray, out hit, 500f)) return;
+            Actor target = hit.collider.GetComponentInParent<Actor>();
+            if (target == null || target == localPlayer || target.dead) return;
+
+            try { target.team = localPlayer.team; } catch { }
+            // 同时改 AI 里缓存的 squad/team
+            var aiType = typeof(Actor).Assembly.GetType("AiActorController");
+            if (aiType != null)
+            {
+                var aiComp = target.GetComponent(aiType);
+                if (aiComp != null)
+                {
+                    var t = aiComp.GetType();
+                    SetField(aiComp, t, "targetActor", null);
+                    SetField(aiComp, t, "squad", null);
+                    SetField(aiComp, t, "hasTargetVisible", false);
+                    SetField(aiComp, t, "hasSeenTarget", false);
+                }
+            }
+            target.health = target.maxHealth; // 回满血
+        }
+
+        // ============ 死亡射线 (按住 M + 左键) ============
+        // 从视线发出一道光，经过路径上所有敌人和载具全部爆炸
+        private float deathRayTimer = 0f;
+        private void DeathRayLogic()
+        {
+            if (!Input.GetKey(KeyCode.M) || !Input.GetMouseButton(0)) return;
+            deathRayTimer += Time.deltaTime;
+            if (deathRayTimer < 0.05f) return;
+            deathRayTimer = 0f;
+            if (mainCam == null) return;
+
+            Vector3 origin = mainCam.transform.position;
+            Vector3 dir = mainCam.transform.forward;
+            float maxDist = 1000f;
+
+            // 炸敌人
             foreach (var a in ActorManager.instance.actors)
             {
                 if (a == null || a == localPlayer || a.dead) continue;
                 if (!bFriendlyFire && a.team == localPlayer.team) continue;
-                try
-                {
-                    var m = a.GetType().GetMethod("Ragdoll", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, Type.EmptyTypes, null);
-                    if (m != null) m.Invoke(a, null);
-                } catch { }
-                Rigidbody arb = null;
-                try { arb = a.rigidbody; } catch { }
-                if (arb != null)
-                {
-                    arb.isKinematic = false;
-                    arb.velocity = new Vector3(UnityEngine.Random.Range(-10f, 10f), 8f, UnityEngine.Random.Range(-10f, 10f));
-                }
+                Vector3 toA = GetActorCenter(a) - origin;
+                float fw = Vector3.Dot(toA, dir);
+                if (fw < 0f || fw > maxDist) continue;
+                Vector3 nearest = origin + dir * fw;
+                float perp = Vector3.Distance(GetActorCenter(a), nearest);
+                if (perp > 3f) continue; // 3m 粗的射线
+                try { ExplodeAt(a.transform.position + Vector3.up * 0.5f, 8f); } catch { }
+            }
+            // 炸载具
+            var vehs = UnityEngine.Object.FindObjectsOfType<Vehicle>();
+            foreach (var v in vehs)
+            {
+                if (v == null) continue;
+                if (localPlayer.seat != null && v == localPlayer.seat.vehicle) continue;
+                Vector3 toV = v.transform.position - origin;
+                float fw = Vector3.Dot(toV, dir);
+                if (fw < 0f || fw > maxDist) continue;
+                Vector3 nearest = origin + dir * fw;
+                if (Vector3.Distance(v.transform.position, nearest) > 4f) continue;
+                try { v.health = -1000f; SetField(v, v.GetType(), "dead", true); } catch { }
             }
         }
+
 
         // ============ 无限手雷 ============
         private void InfiniteGrenadesLogic()
