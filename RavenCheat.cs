@@ -828,11 +828,12 @@ namespace RavenCheat
         private void TriggerRiotMode()
         {
             if (ActorManager.instance == null || ActorManager.instance.actors == null) return;
-            int teamId = 10;
             foreach (var a in ActorManager.instance.actors)
             {
                 if (a == null || a == localPlayer || a.dead) continue;
-                try { a.team = teamId++; } catch { }
+                // 修复：原游戏最多只有2-3个队伍阵营，设置过大的teamId会导致数组越界崩溃 (IndexOutOfRangeException)
+                // 现在将全图AI随机分配为红蓝两队，原地立刻反水互殴，达到真正的暴乱效果
+                try { a.team = UnityEngine.Random.Range(0, 2); } catch { }
             }
         }
 
