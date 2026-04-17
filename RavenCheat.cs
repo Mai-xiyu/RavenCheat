@@ -73,6 +73,8 @@ namespace RavenCheat
         public bool bEspLines = false;          // ESP 从屏幕中心画线
         public bool bVehicleRainbow = false;    // 载具彩虹色（彩蛋）
         public bool bSuperReach = false;        // 超远传送距离
+        public bool bInfiniteGrenades = false;  // 无限手雷
+        public bool bExplodeOnDeath = false;    // 敌人死亡时自爆（神风连锁）
 
         // ============ 运行时状态 ============
         private Actor localPlayer;
@@ -95,6 +97,14 @@ namespace RavenCheat
         private readonly HashSet<Rigidbody> ufoTouchedVehicles = new HashSet<Rigidbody>();
         private float laserTimer = 0f;
         private float airstrikeTimer = 0f;
+
+        // 用于冻结敌人功能关闭后恢复 AI 控制器
+        private readonly HashSet<Behaviour> frozenAiControllers = new HashSet<Behaviour>();
+        // 已知死亡的敌人（用于“死亡时自爆”只触发一次）
+        private readonly HashSet<int> alreadyDetonated = new HashSet<int>();
+        // Chams 缓存：已染色的 Renderer 就不再 new 材质了（避免 Unity 材质泄漏）
+        private readonly HashSet<int> chamsTouched = new HashSet<int>();
+        private readonly Dictionary<int, float> rainbowLastUpdate = new Dictionary<int, float>();
 
         private void Start()
         {
@@ -160,10 +170,17 @@ namespace RavenCheat
             try { if (bLaserGun) LaserGunLogic(); } catch { }
             try { if (bAutoHeal) AutoHealLogic(); } catch { }
             try { if (bVehicleRainbow) VehicleRainbowLogic(); } catch { }
+            try { if (bInfiniteGrenades) InfiniteGrenadesLogic(); } catch { }
+            try { if (bExplodeOnDeath) ExplodeOnDeathLogic(); } catch { }
+            try { RestoreFrozenAiIfNeeded(); } catch { }
             try { TeleportLogic(); } catch { }
             try { ThorHammerLogic(); } catch { }
             try { AirstrikeLogic(); } catch { }
             try { ExplodeAllVehiclesHotkey(); } catch { }
+            try { GrappleHookLogic(); } catch { }
+            try { ForcePushLogic(); } catch { }
+            try { ShadowStrikeLogic(); } catch { }
+            try { RagdollAllLogic(); } catch { }
         }
 
         private void LateUpdate()
@@ -265,6 +282,8 @@ namespace RavenCheat
             bFreezeEnemies = GUILayout.Toggle(bFreezeEnemies, "冻结敌人 (敌人停止移动)");
             bBlindAI = GUILayout.Toggle(bBlindAI, "AI 失明 (敌人看不到你)");
             bMagnet = GUILayout.Toggle(bMagnet, "磁力吸附 (吸敌人过来)");
+            bExplodeOnDeath = GUILayout.Toggle(bExplodeOnDeath, "神风连锁 (敌人死时自爆)");
+            bInfiniteGrenades = GUILayout.Toggle(bInfiniteGrenades, "无限手雷");
 
             GUILayout.Label("── 世界 ──");
             bTimeFreeze = GUILayout.Toggle(bTimeFreeze, "时间减速 (敌人慢动作)");
@@ -275,10 +294,14 @@ namespace RavenCheat
             GUILayout.Space(4);
             GUILayout.Label("── 快捷键 ──");
             GUILayout.Label("  T = 传送到准星位置");
-            GUILayout.Label("  V = 隔空取车 (将最近载具传送到面前)");
+            GUILayout.Label("  V = 隔空取车 (最近载具传送到面前)");
             GUILayout.Label("  G = 索尔之锤 (准星处爆炸)");
             GUILayout.Label("  B = 空袭轰炸 (准星处大范围杀敌)");
             GUILayout.Label("  H = 一键爆掉所有敌方载具");
+            GUILayout.Label("  F = 🪝 钩锁/飞爪 (拉向准星位置)");
+            GUILayout.Label("  R = 💨 原力冲击波 (推飞周围敌人)");
+            GUILayout.Label("  Y = ⚡ Shadow Strike (瞬移到最近敌人背后)");
+            GUILayout.Label("  K = 🧍 布娃娃全图 (敌人瘰倒)");
             GUILayout.Label("  Insert = 开关此菜单");
             GUI.DragWindow();
         }
@@ -393,6 +416,10 @@ namespace RavenCheat
             foreach (var a in ActorManager.instance.actors)
             {
                 if (a == null || a == localPlayer || a.dead) continue;
+                int id = a.GetInstanceID();
+                // 修复：Unity 的 renderer.material 每帧 new 一个新材质会造成内存泄漏
+                // 用 Actor InstanceID 标记已染色 → 只染一次，避免泏泊造材质
+                if (chamsTouched.Contains(id)) continue;
                 bool isEnemy = a.team != localPlayer.team;
                 var renderers = a.GetComponentsInChildren<Renderer>();
                 Color tint = isEnemy ? new Color(1f, 0.2f, 0.2f, 1f) : new Color(0.2f, 1f, 0.2f, 1f);
@@ -401,6 +428,7 @@ namespace RavenCheat
                     if (r == null || r.material == null) continue;
                     try { r.material.color = tint; } catch { }
                 }
+                chamsTouched.Add(id);
             }
         }
 
@@ -584,6 +612,15 @@ namespace RavenCheat
             foreach (var p in projs)
             {
                 if (p == null) continue;
+                // 修复：只放大自己阵营的子弹，不然敌人子弹也变大会擞死自己
+                int ownerTeam = -1;
+                try
+                {
+                    var tf = p.GetType().GetField("ownerTeam", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                    if (tf != null) ownerTeam = (int)tf.GetValue(p);
+                } catch { }
+                if (ownerTeam != -1 && ownerTeam != localPlayer.team) continue;
+
                 if (p.transform.localScale.x < 5f)
                     p.transform.localScale = Vector3.one * 5f;
             }
@@ -828,12 +865,160 @@ namespace RavenCheat
         private void TriggerRiotMode()
         {
             if (ActorManager.instance == null || ActorManager.instance.actors == null) return;
+            var asm = typeof(Actor).Assembly;
+            var aiType = asm.GetType("AiActorController");
             foreach (var a in ActorManager.instance.actors)
             {
                 if (a == null || a == localPlayer || a.dead) continue;
-                // 修复：原游戏最多只有2-3个队伍阵营，设置过大的teamId会导致数组越界崩溃 (IndexOutOfRangeException)
-                // 现在将全图AI随机分配为红蓝两队，原地立刻反水互殴，达到真正的暴乱效果
+                // 修复：原游戏只有 2-3 个阵营，设置过大 teamId 会 IndexOutOfRange 崩游戏
+                // 随机分配为红蓝两队，达到真正的暴乱效果
                 try { a.team = UnityEngine.Random.Range(0, 2); } catch { }
+
+                // 清空 AI 旧目标，让它们重新选目标（否则会继续打玩家几秒）
+                if (aiType != null)
+                {
+                    var aiComp = a.GetComponent(aiType);
+                    if (aiComp != null)
+                    {
+                        var t = aiComp.GetType();
+                        SetField(aiComp, t, "targetActor", null);
+                        SetField(aiComp, t, "hasTargetVisible", false);
+                        SetField(aiComp, t, "hasSeenTarget", false);
+                    }
+                }
+            }
+        }
+
+        // ============ 钩锁/飞爪 (F键) ============
+        private float grappleCooldown = 0f;
+        private void GrappleHookLogic()
+        {
+            grappleCooldown -= Time.deltaTime;
+            if (!Input.GetKeyDown(KeyCode.F) || grappleCooldown > 0f) return;
+            if (mainCam == null) return;
+
+            Ray ray = new Ray(mainCam.transform.position, mainCam.transform.forward);
+            int mask = ~((1 << 9) | (1 << 18));
+            RaycastHit hit;
+            if (!Physics.Raycast(ray, out hit, 500f, mask)) return;
+
+            grappleCooldown = 0.3f;
+            Vector3 dest = hit.point + Vector3.up * 1.5f;
+
+            CharacterController cc = localPlayer.GetComponentInChildren<CharacterController>();
+            if (cc != null) cc.enabled = false;
+            try { localPlayer.SetPositionAndRotation(dest, localPlayer.transform.rotation); }
+            catch { localPlayer.transform.position = dest; }
+            if (cc != null) cc.enabled = true;
+
+            Rigidbody rb = null;
+            try { rb = localPlayer.rigidbody; } catch { }
+            if (rb != null) rb.velocity = mainCam.transform.forward * 5f;
+        }
+
+        // ============ 原力冲击波 (R键) ============
+        private float forceCooldown = 0f;
+        private void ForcePushLogic()
+        {
+            forceCooldown -= Time.deltaTime;
+            if (!Input.GetKeyDown(KeyCode.R) || forceCooldown > 0f) return;
+            if (ActorManager.instance == null || ActorManager.instance.actors == null) return;
+            forceCooldown = 1f;
+
+            Vector3 center = localPlayer.transform.position;
+            foreach (var a in ActorManager.instance.actors)
+            {
+                if (a == null || a == localPlayer || a.dead) continue;
+                if (!bFriendlyFire && a.team == localPlayer.team) continue;
+                Vector3 dir = a.transform.position - center;
+                float d = dir.magnitude;
+                if (d > 30f || d < 0.1f) continue;
+
+                Vector3 push = dir.normalized * 40f + Vector3.up * 15f;
+                Rigidbody arb = null;
+                try { arb = a.rigidbody; } catch { }
+                if (arb != null) { arb.isKinematic = false; arb.velocity = push; }
+
+                // 让 AI 进入布娃娃状态
+                try
+                {
+                    var m = a.GetType().GetMethod("Ragdoll", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, Type.EmptyTypes, null);
+                    if (m != null) m.Invoke(a, null);
+                } catch { }
+            }
+        }
+
+        // ============ Shadow Strike (Y键) — 瞬移到最近敌人背后 ============
+        private void ShadowStrikeLogic()
+        {
+            if (!Input.GetKeyDown(KeyCode.Y)) return;
+            Actor target = FindClosestEnemy(localPlayer.transform.position);
+            if (target == null) return;
+
+            Vector3 behind = target.transform.position - target.transform.forward * 1.5f + Vector3.up * 0.5f;
+            CharacterController cc = localPlayer.GetComponentInChildren<CharacterController>();
+            if (cc != null) cc.enabled = false;
+            try { localPlayer.SetPositionAndRotation(behind, Quaternion.LookRotation(target.transform.position - behind)); }
+            catch { localPlayer.transform.position = behind; }
+            if (cc != null) cc.enabled = true;
+        }
+
+        // ============ 布娃娃全图 (K键) ============
+        private void RagdollAllLogic()
+        {
+            if (!Input.GetKeyDown(KeyCode.K)) return;
+            if (ActorManager.instance == null) return;
+            foreach (var a in ActorManager.instance.actors)
+            {
+                if (a == null || a == localPlayer || a.dead) continue;
+                if (!bFriendlyFire && a.team == localPlayer.team) continue;
+                try
+                {
+                    var m = a.GetType().GetMethod("Ragdoll", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, Type.EmptyTypes, null);
+                    if (m != null) m.Invoke(a, null);
+                } catch { }
+                Rigidbody arb = null;
+                try { arb = a.rigidbody; } catch { }
+                if (arb != null)
+                {
+                    arb.isKinematic = false;
+                    arb.velocity = new Vector3(UnityEngine.Random.Range(-10f, 10f), 8f, UnityEngine.Random.Range(-10f, 10f));
+                }
+            }
+        }
+
+        // ============ 无限手雷 ============
+        private void InfiniteGrenadesLogic()
+        {
+            if (localPlayer.seat != null) return;
+            var t = localPlayer.GetType();
+            SetField(localPlayer, t, "grenades", 99);
+            var f = t.GetField("maxGrenades", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            if (f != null) try { f.SetValue(localPlayer, 99); } catch { }
+        }
+
+        // ============ 敌人死亡自爆 (神风连锁) ============
+        private void ExplodeOnDeathLogic()
+        {
+            if (ActorManager.instance == null || ActorManager.instance.actors == null) return;
+            foreach (var a in ActorManager.instance.actors)
+            {
+                if (a == null || a == localPlayer) continue;
+                if (!bFriendlyFire && a.team == localPlayer.team) continue;
+                int id = a.GetInstanceID();
+                if (a.dead)
+                {
+                    if (!alreadyDetonated.Contains(id))
+                    {
+                        alreadyDetonated.Add(id);
+                        try { ExplodeAt(a.transform.position + Vector3.up * 0.5f, 12f); } catch { }
+                    }
+                }
+                else
+                {
+                    // 复活后允许再次触发
+                    if (alreadyDetonated.Contains(id)) alreadyDetonated.Remove(id);
+                }
             }
         }
 
@@ -989,9 +1174,24 @@ namespace RavenCheat
                 if (aiType != null)
                 {
                     var aiComp = a.GetComponent(aiType) as Behaviour;
-                    if (aiComp != null) aiComp.enabled = false;
+                    if (aiComp != null && aiComp.enabled)
+                    {
+                        aiComp.enabled = false;
+                        frozenAiControllers.Add(aiComp); // 记录以便关闭功能时恢复
+                    }
                 }
             }
+        }
+
+        // 关闭冻结后恢复所有 AI
+        private void RestoreFrozenAiIfNeeded()
+        {
+            if (bFreezeEnemies || frozenAiControllers.Count == 0) return;
+            foreach (var ai in frozenAiControllers)
+            {
+                if (ai != null) ai.enabled = true;
+            }
+            frozenAiControllers.Clear();
         }
 
         // ============ AI 失明 ============
@@ -1077,17 +1277,23 @@ namespace RavenCheat
         // ============ 载具彩虹色 ============
         private void VehicleRainbowLogic()
         {
+            // 每 0.1s 更新一次，避免每帧泏泊造材质
             var vehicles = UnityEngine.Object.FindObjectsOfType<Vehicle>();
             foreach (var v in vehicles)
             {
                 if (v == null) continue;
-                float hue = (Time.time * 0.5f + v.GetInstanceID() * 0.1f) % 1f;
+                int id = v.GetInstanceID();
+                float last;
+                if (rainbowLastUpdate.TryGetValue(id, out last) && Time.time - last < 0.1f) continue;
+                rainbowLastUpdate[id] = Time.time;
+
+                float hue = (Time.time * 0.5f + id * 0.1f) % 1f;
                 if (hue < 0) hue += 1f;
                 Color c = Color.HSVToRGB(hue, 1f, 1f);
                 var renderers = v.GetComponentsInChildren<Renderer>();
                 foreach (var r in renderers)
                 {
-                    if (r == null || r.material == null) continue;
+                    if (r == null || r.sharedMaterial == null) continue;
                     try { r.material.color = c; } catch { }
                 }
             }
