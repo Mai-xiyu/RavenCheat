@@ -61,6 +61,8 @@ namespace RavenCheat
         public bool bLowGravity = false;
 
         // 新增
+        public bool bExplosiveAmmo = false;     // 高爆子弹
+        public bool bVehicleBoost = false;      // 载具飞跃
         public bool bFreezeEnemies = false;     // 冻结敌人位置
         public bool bBlindAI = false;           // AI 失明
         public bool bMagnet = false;            // 磁力吸附敌人
@@ -145,6 +147,9 @@ namespace RavenCheat
             try { if (bUFOMode) UFOModeLogic(); } catch { }
             try { RestoreUFOVehiclesIfNeeded(); } catch { }
             try { if (bSpeedHack || bFly || bNoClip || bJumpBoost) MovementHackLogic(); } catch { }
+            try { if (bExplosiveAmmo) ExplosiveAmmoLogic(); } catch { }
+            try { if (bVehicleBoost) VehicleBoostLogic(); } catch { }
+            try { SummonVehicleHotkey(); } catch { }
             try { if (bMagicBullet && !bKillAll) MagicBulletLogic(); } catch { }
             try { if (bKillAll) KillAllLogic(); } catch { }
             try { if (bAutoKill) AutoKillLogic(); } catch { }
@@ -236,6 +241,7 @@ namespace RavenCheat
             bNoRecoil = GUILayout.Toggle(bNoRecoil, "无后坐力 / 无散布");
             bRapidFire = GUILayout.Toggle(bRapidFire, "极速射击 (无冷却)");
             bBigBullets = GUILayout.Toggle(bBigBullets, "巨型子弹 (子弹变大)");
+            bExplosiveAmmo = GUILayout.Toggle(bExplosiveAmmo, "高爆弹药 (左键指哪炸哪)");
 
             GUILayout.Label("── 防御 ──");
             bGodMode = GUILayout.Toggle(bGodMode, "无敌模式 (血量无限)");
@@ -252,8 +258,10 @@ namespace RavenCheat
             GUILayout.Label("── 载具 ──");
             bUFOMode = GUILayout.Toggle(bUFOMode, "UFO 载具 (鼠标控制方向)");
             bVehicleRainbow = GUILayout.Toggle(bVehicleRainbow, "载具彩虹色 (调教用)");
+            bVehicleBoost = GUILayout.Toggle(bVehicleBoost, "载具飞跃 (Shift加速, 空格跳跃)");
 
             GUILayout.Label("── 控制敌人 ──");
+            if (GUILayout.Button("🔥 触发全民暴乱 (全图大逃杀)")) TriggerRiotMode();
             bFreezeEnemies = GUILayout.Toggle(bFreezeEnemies, "冻结敌人 (敌人停止移动)");
             bBlindAI = GUILayout.Toggle(bBlindAI, "AI 失明 (敌人看不到你)");
             bMagnet = GUILayout.Toggle(bMagnet, "磁力吸附 (吸敌人过来)");
@@ -267,6 +275,7 @@ namespace RavenCheat
             GUILayout.Space(4);
             GUILayout.Label("── 快捷键 ──");
             GUILayout.Label("  T = 传送到准星位置");
+            GUILayout.Label("  V = 隔空取车 (将最近载具传送到面前)");
             GUILayout.Label("  G = 索尔之锤 (准星处爆炸)");
             GUILayout.Label("  B = 空袭轰炸 (准星处大范围杀敌)");
             GUILayout.Label("  H = 一键爆掉所有敌方载具");
@@ -815,6 +824,103 @@ namespace RavenCheat
             }
         }
 
+        // ============ 全民暴乱 ============
+        private void TriggerRiotMode()
+        {
+            if (ActorManager.instance == null || ActorManager.instance.actors == null) return;
+            int teamId = 10;
+            foreach (var a in ActorManager.instance.actors)
+            {
+                if (a == null || a == localPlayer || a.dead) continue;
+                try { a.team = teamId++; } catch { }
+            }
+        }
+
+        // ============ 公用爆炸方法 ============
+        private void ExplodeAt(Vector3 point, float radius = 15f)
+        {
+            try
+            {
+                var amType = typeof(ActorManager);
+                var explodeMethods = amType.GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                foreach (var em in explodeMethods)
+                {
+                    if (em.Name != "Explode") continue;
+                    var pars = em.GetParameters();
+                    if (pars.Length == 1 && pars[0].ParameterType == typeof(Vector3))
+                    { em.Invoke(null, new object[] { point }); return; }
+                }
+            } catch { }
+
+            // Fallback
+            foreach (var a in ActorManager.instance.actors)
+            {
+                if (a == null || a == localPlayer || a.dead) continue;
+                if (!bFriendlyFire && a.team == localPlayer.team) continue;
+                if (Vector3.Distance(a.transform.position, point) < radius)
+                {
+                    try { a.health = -1000f; a.dead = true; } catch { }
+                }
+            }
+        }
+
+        // ============ 高爆弹药 ============
+        private void ExplosiveAmmoLogic()
+        {
+            if (!Input.GetMouseButton(0)) return;
+            laserTimer += Time.deltaTime; // 借用 laserTimer 控速
+            if (laserTimer < 0.1f) return;
+            laserTimer = 0f;
+
+            if (mainCam == null) return;
+            Ray ray = new Ray(mainCam.transform.position, mainCam.transform.forward);
+            RaycastHit hit;
+            if (Physics.Raycast(ray, out hit, 1000f))
+            {
+                ExplodeAt(hit.point + Vector3.up * 0.5f, 15f);
+            }
+        }
+
+        // ============ 载具飞越强化 ============
+        private void VehicleBoostLogic()
+        {
+            if (localPlayer.seat == null || localPlayer.seat.vehicle == null) return;
+            Rigidbody rb = localPlayer.seat.vehicle.GetComponent<Rigidbody>();
+            if (rb == null) return;
+
+            if (Input.GetKey(KeyCode.LeftShift))
+                rb.velocity += localPlayer.seat.vehicle.transform.forward * 40f * Time.deltaTime;
+
+            if (Input.GetKeyDown(KeyCode.Space))
+                rb.velocity = new Vector3(rb.velocity.x, 15f, rb.velocity.z);
+        }
+
+        // ============ 隔空召唤载具 ============
+        private void SummonVehicleHotkey()
+        {
+            if (!Input.GetKeyDown(KeyCode.V)) return;
+            var vehicles = UnityEngine.Object.FindObjectsOfType<Vehicle>();
+            Vehicle closest = null;
+            float minDist = float.MaxValue;
+            Vector3 playerPos = localPlayer.transform.position;
+
+            foreach (var v in vehicles)
+            {
+                if (v == null || (localPlayer.seat != null && v == localPlayer.seat.vehicle)) continue;
+                float d = Vector3.Distance(v.transform.position, playerPos);
+                if (d < minDist) { minDist = d; closest = v; }
+            }
+
+            if (closest != null)
+            {
+                Vector3 fw = mainCam.transform.forward; fw.y = 0; fw.Normalize();
+                closest.transform.position = playerPos + fw * 4f + Vector3.up * 1f;
+                closest.transform.rotation = Quaternion.LookRotation(fw);
+                Rigidbody rb = closest.GetComponent<Rigidbody>();
+                if (rb != null) rb.velocity = Vector3.zero;
+            }
+        }
+
         // ============ 索尔之锤 ============
         private void ThorHammerLogic()
         {
@@ -824,31 +930,7 @@ namespace RavenCheat
             RaycastHit hit;
             if (Physics.Raycast(ray, out hit, 5000f))
             {
-                // 尝试通过反射调用 ActorManager.Explode（签名不稳定，失败则用兜底方案）
-                try
-                {
-                    var amType = typeof(ActorManager);
-                    var explodeMethods = amType.GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
-                    foreach (var em in explodeMethods)
-                    {
-                        if (em.Name != "Explode") continue;
-                        var pars = em.GetParameters();
-                        if (pars.Length == 1 && pars[0].ParameterType == typeof(Vector3))
-                        { em.Invoke(null, new object[] { hit.point + Vector3.up * 0.5f }); break; }
-                    }
-                } catch { }
-
-                // 手动对所有敌人造成伤害（兜底）
-                float radius = 30f;
-                foreach (var a in ActorManager.instance.actors)
-                {
-                    if (a == null || a == localPlayer || a.dead) continue;
-                    if (!bFriendlyFire && a.team == localPlayer.team) continue;
-                    if (Vector3.Distance(a.transform.position, hit.point) < radius)
-                    {
-                        try { a.health = -1000f; a.dead = true; } catch { }
-                    }
-                }
+                ExplodeAt(hit.point + Vector3.up * 0.5f, 30f);
             }
         }
 
