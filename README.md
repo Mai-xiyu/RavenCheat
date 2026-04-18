@@ -1,7 +1,6 @@
 ﻿# Ravenfield Internal Cheat (RavenCheat)
 
 一个功能极其丰富的 Ravenfield (战地模拟器) 内部作弊/Mod菜单。
-不仅包含传统的自瞄、透视等功能，还加入了一系列 **GTA V 风格** 的疯狂沙盒玩法（龙卷风、原力冲击、真实钩爪、全图大逃杀等）。
 
 ## 核心特色功能 (Sandbox & Chaos)
 - **龙卷风 (Tornado)** - 在准星处生成龙卷风，将范围内的敌人和载具卷入高空，6秒后剧烈爆炸。
